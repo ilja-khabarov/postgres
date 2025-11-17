@@ -21,10 +21,6 @@
 
 #include "postgres.h"
 
-#include <unistd.h>
-#include <sys/stat.h>
-
-#include "common/file_perm.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/pgfile.h"
@@ -54,7 +50,7 @@ pgfile_open(const char *filename)
 	PgFile	   *pgfile;
 	File		vfd;
 	char		path[MAXPGPATH];
-	struct stat st;
+	off_t		file_size;
 
 	/* Build the full path in the data directory */
 	snprintf(path, MAXPGPATH, "%s/%s", DataDir, filename);
@@ -72,12 +68,13 @@ pgfile_open(const char *filename)
 	pgfile->filename = MemoryContextStrdup(TopMemoryContext, filename);
 
 	/* Determine the current number of pages in the file */
-	if (FileStat(vfd, &st) < 0)
+	file_size = FileSize(vfd);
+	if (file_size < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not stat file \"%s\": %m", path)));
+				 errmsg("could not get size of file \"%s\": %m", path)));
 
-	pgfile->num_pages = st.st_size / PGFILE_PAGE_SIZE;
+	pgfile->num_pages = file_size / PGFILE_PAGE_SIZE;
 
 	return pgfile;
 }
@@ -118,8 +115,8 @@ pgfile_write_page(PgFile *file, uint32 pageno, const char *buffer)
 	offset = (off_t) pageno * PGFILE_PAGE_SIZE;
 
 	/* Write the page */
-	nbytes = FilePWrite(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
-						WAIT_EVENT_DATA_FILE_WRITE);
+	nbytes = FileWrite(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
+					   WAIT_EVENT_DATA_FILE_WRITE);
 
 	if (nbytes != PGFILE_PAGE_SIZE)
 	{
@@ -168,8 +165,8 @@ pgfile_read_page(PgFile *file, uint32 pageno, char *buffer)
 	offset = (off_t) pageno * PGFILE_PAGE_SIZE;
 
 	/* Read the page */
-	nbytes = FilePRead(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
-					   WAIT_EVENT_DATA_FILE_READ);
+	nbytes = FileRead(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
+					  WAIT_EVENT_DATA_FILE_READ);
 
 	if (nbytes != PGFILE_PAGE_SIZE)
 	{
