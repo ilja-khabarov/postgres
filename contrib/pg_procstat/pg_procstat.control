@@ -1,0 +1,5 @@
+# pg_procstat extension
+comment = 'Process statistics recorder with bidirectional page-based reading'
+default_version = '1.0'
+module_pathname = '$libdir/pg_procstat'
+relocatable = true

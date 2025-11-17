@@ -1,0 +1,211 @@
+pg_procstat - Process Statistics Recorder with Bidirectional Page Reading
+===========================================================================
+
+This extension demonstrates advanced page-based file I/O patterns by implementing
+a process statistics recorder that stores PostgreSQL backend statistics snapshots
+in fixed-size pages and supports bidirectional reading.
+
+Key Features
+------------
+* Custom page structure with metadata headers
+* Bidirectional page reading (forward and backward)
+* Process statistics snapshots stored in pages
+* Page validation with magic numbers and checksums
+* Efficient storage using the pgfile module
+* Demonstrates advanced page I/O patterns
+
+Architecture
+------------
+
+**Page Structure:**
+
+Each page contains:
+- Header (ProcstatPageHeader):
+  * size: Actual data size in page
+  * record_count: Number of process records
+  * timestamp: Page write timestamp
+  * page_number: Sequential page number
+  * magic: Magic number for validation (0x50535441 = "PSTA")
+  * checksum: Data integrity checksum
+
+- Data: Flexible array of ProcstatRecord structures
+
+**Bidirectional Reading:**
+
+The extension implements a sophisticated reader (ProcstatFileReader) that supports:
+- Forward reading: Start from page 0, read sequentially to the end
+- Backward reading: Start from last page, read sequentially to the beginning
+
+This demonstrates how to implement efficient bidirectional iteration over
+page-based files - a common requirement in logging, audit, and time-series systems.
+
+**Storage Format:**
+
+File: procstat.dat in PostgreSQL data directory
+- Pages are PGFILE_PAGE_SIZE (8KB) each
+- Each page contains one snapshot of backend statistics
+- Pages are numbered sequentially starting from 0
+- Pages include checksums for data integrity validation
+
+Installation
+------------
+Build and install the extension:
+
+    make
+    make install
+
+Then in PostgreSQL:
+
+    CREATE EXTENSION pg_procstat;
+
+Functions
+---------
+
+procstat_record() RETURNS integer
+    Record a snapshot of current backend process statistics.
+    Returns the number of backends recorded in this snapshot.
+
+procstat_read_forward() RETURNS SETOF record
+    Read all recorded statistics in forward (chronological) order.
+    Demonstrates forward page iteration from start to end.
+
+    Returns: page_number, page_timestamp, pid, database_oid, user_oid,
+             backend_start, query_start, snapshot_time, application_name, state
+
+procstat_read_backward() RETURNS SETOF record
+    Read all recorded statistics in backward (reverse chronological) order.
+    Demonstrates backward page iteration from end to start.
+
+    Returns: Same columns as procstat_read_forward()
+
+procstat_clear() RETURNS void
+    Clear all recorded statistics data by removing the storage file.
+
+procstat_stats() RETURNS TABLE
+    Get statistics about the storage file.
+
+    Returns: total_pages (integer), file_size (bigint), page_size (integer)
+
+Usage Examples
+--------------
+
+-- Create the extension
+CREATE EXTENSION pg_procstat;
+
+-- Record a snapshot of current backends
+SELECT procstat_record();
+
+-- Wait a bit and record another snapshot
+SELECT pg_sleep(5);
+SELECT procstat_record();
+
+-- Read all snapshots in chronological order (forward)
+SELECT page_number, page_timestamp, pid, state, application_name
+FROM procstat_read_forward()
+ORDER BY page_number, pid;
+
+-- Read all snapshots in reverse chronological order (backward)
+SELECT page_number, page_timestamp, pid, state, application_name
+FROM procstat_read_backward()
+ORDER BY page_number DESC, pid;
+
+-- View the most recent snapshots first
+SELECT page_number, count(*) as backend_count
+FROM procstat_read_backward()
+GROUP BY page_number
+ORDER BY page_number DESC
+LIMIT 5;
+
+-- Get file statistics
+SELECT * FROM procstat_stats();
+
+-- Clear all data
+SELECT procstat_clear();
+
+Implementation Highlights
+-------------------------
+
+**Core Page I/O Functions:**
+
+1. write_page(Page page)
+   - Appends page to file or creates new file
+   - Automatically assigns sequential page numbers
+   - Adds timestamp, magic number, and checksum
+   - Uses pgfile_write_page() for efficient I/O
+
+2. init_reader(bool forward)
+   - Initializes reader context for bidirectional reading
+   - Sets starting position based on direction
+   - forward=true: start at page 0
+   - forward=false: start at last page
+
+3. get_next_page(ProcstatFileReader *reader)
+   - Reads next page based on direction
+   - Validates page integrity (magic + checksum)
+   - Returns NULL when exhausted
+   - Advances reader position appropriately
+
+**Page Validation:**
+
+Each page is validated on read:
+- Magic number check (0x50535441)
+- Size bounds validation
+- Checksum verification of data
+
+**Bidirectional Reading Algorithm:**
+
+Forward (chronological):
+  current_page = 0
+  while current_page < total_pages:
+    read page at current_page
+    process page
+    current_page++
+
+Backward (reverse chronological):
+  current_page = total_pages - 1
+  while current_page >= 0:
+    read page at current_page
+    process page
+    current_page--
+
+Use Cases
+---------
+
+This extension pattern is useful for:
+* Time-series data with chronological and reverse queries
+* Audit logs that need recent-first access
+* Process monitoring and historical analysis
+* Any system requiring efficient bidirectional page access
+
+Performance Characteristics
+---------------------------
+
+* Page reads: O(1) random access via pgfile
+* Forward scan: O(n) where n = number of pages
+* Backward scan: O(n) where n = number of pages
+* Memory usage: Constant (one page buffer per reader)
+* Storage overhead: ~48 bytes per page (header)
+
+Technical Details
+-----------------
+
+**Page Size:** 8192 bytes (PGFILE_PAGE_SIZE)
+
+**Maximum Records Per Page:**
+  (8192 - sizeof(ProcstatPageHeader)) / sizeof(ProcstatRecord)
+  ≈ (8192 - 48) / 152 ≈ 53 records per page
+
+**Checksum Algorithm:** Simple additive checksum
+  checksum = Σ((checksum << 5) + checksum + byte[i])
+
+**Dependencies:**
+* pgfile module (src/backend/storage/file/pgfile.c)
+* PostgreSQL process statistics (pgstat)
+
+Author
+------
+PostgreSQL Global Development Group
+
+License
+-------
+PostgreSQL License
