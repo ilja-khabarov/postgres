@@ -10,13 +10,12 @@ implementation built directly into the extension code.
 
 Key Features
 ------------
-* Custom page structure with metadata headers
+* Simple page structure with metadata headers
 * Bidirectional page reading (forward and backward)
 * Process statistics snapshots stored in pages
-* Page validation with magic numbers and checksums
 * Integrated page-based file I/O implementation (8KB fixed-size pages)
 * Self-contained extension with no external dependencies
-* Demonstrates advanced page I/O patterns
+* Clean, straightforward implementation
 
 Architecture
 ------------
@@ -29,14 +28,12 @@ Each page contains:
   * record_count: Number of process records
   * timestamp: Page write timestamp
   * page_number: Sequential page number
-  * magic: Magic number for validation (0x50535441 = "PSTA")
-  * checksum: Data integrity checksum
 
 - Data: Flexible array of ProcstatRecord structures
 
 **Bidirectional Reading:**
 
-The extension implements a sophisticated reader (ProcstatFileReader) that supports:
+The extension implements a simple reader (ProcstatFileReader) that supports:
 - Forward reading: Start from page 0, read sequentially to the end
 - Backward reading: Start from last page, read sequentially to the beginning
 
@@ -49,7 +46,6 @@ File: procstat.dat in PostgreSQL data directory
 - Pages are PGFILE_PAGE_SIZE (8KB) each
 - Each page contains one snapshot of backend statistics
 - Pages are numbered sequentially starting from 0
-- Pages include checksums for data integrity validation
 
 Installation
 ------------
@@ -132,29 +128,21 @@ Implementation Highlights
 **Core Page I/O Functions:**
 
 1. write_page(Page page)
-   - Appends page to file or creates new file
-   - Automatically assigns sequential page numbers
-   - Adds timestamp, magic number, and checksum
-   - Uses pgfile_write_page() for efficient I/O
+   - Appends page to file
+   - Assigns sequential page numbers
+   - Adds timestamp
+   - Writes and syncs to disk
 
 2. init_reader(bool forward)
-   - Initializes reader context for bidirectional reading
-   - Sets starting position based on direction
-   - forward=true: start at page 0
-   - forward=false: start at last page
+   - Initializes reader for bidirectional reading
+   - Sets starting position:
+     * forward=true: start at page 0
+     * forward=false: start at last page
 
 3. get_next_page(ProcstatFileReader *reader)
    - Reads next page based on direction
-   - Validates page integrity (magic + checksum)
-   - Returns NULL when exhausted
-   - Advances reader position appropriately
-
-**Page Validation:**
-
-Each page is validated on read:
-- Magic number check (0x50535441)
-- Size bounds validation
-- Checksum verification of data
+   - Returns NULL when no more pages
+   - Advances reader position
 
 **Bidirectional Reading Algorithm:**
 
@@ -188,7 +176,7 @@ Performance Characteristics
 * Forward scan: O(n) where n = number of pages
 * Backward scan: O(n) where n = number of pages
 * Memory usage: Constant (one page buffer per reader)
-* Storage overhead: ~48 bytes per page (header)
+* Storage overhead: ~32 bytes per page (header)
 
 Technical Details
 -----------------
@@ -197,10 +185,7 @@ Technical Details
 
 **Maximum Records Per Page:**
   (8192 - sizeof(ProcstatPageHeader)) / sizeof(ProcstatRecord)
-  ≈ (8192 - 48) / 152 ≈ 53 records per page
-
-**Checksum Algorithm:** Simple additive checksum
-  checksum = Σ((checksum << 5) + checksum + byte[i])
+  ≈ (8192 - 32) / 152 ≈ 53 records per page
 
 **Integrated Page I/O Implementation:**
 The extension includes a complete page-based file I/O implementation integrated

@@ -286,12 +286,7 @@ typedef struct ProcstatPageHeader
 	uint32		record_count;	/* Number of records in this page */
 	TimestampTz timestamp;		/* When this page was written */
 	uint32		page_number;	/* Sequential page number (0-based) */
-	uint32		magic;			/* Magic number for validation */
-	uint32		checksum;		/* Simple checksum of data */
 } ProcstatPageHeader;
-
-/* Magic number for page validation */
-#define PROCSTAT_PAGE_MAGIC		0x50535441	/* "PSTA" */
 
 /*
  * The page structure with flexible array member
@@ -329,190 +324,91 @@ typedef struct ProcstatFileReader
 {
 	PgFile	   *file;			/* pgfile handle */
 	int			current_page_idx;	/* Current page index */
-	int			total_pages;	/* Total pages in file */
 	bool		forward;		/* Direction: true=forward, false=backward */
 	char		page_buffer[PROCSTAT_PAGE_SIZE]; /* Buffer for current page */
-	bool		initialized;	/* Reader initialized? */
-	bool		exhausted;		/* All pages read? */
 } ProcstatFileReader;
 
 /* Forward declarations */
 static void write_page(Page page);
 static ProcstatFileReader init_reader(bool forward);
 static Page get_next_page(ProcstatFileReader *reader);
-static uint32 calculate_checksum(const char *data, Size size);
-static void validate_page(Page page);
 
 /*
- * calculate_checksum - Simple checksum for page data
- */
-static uint32
-calculate_checksum(const char *data, Size size)
-{
-	uint32		checksum = 0;
-	Size		i;
-
-	for (i = 0; i < size; i++)
-		checksum = ((checksum << 5) + checksum) + (unsigned char) data[i];
-
-	return checksum;
-}
-
-/*
- * validate_page - Validate page header and checksum
- */
-static void
-validate_page(Page page)
-{
-	uint32		expected_checksum;
-
-	if (page->header.magic != PROCSTAT_PAGE_MAGIC)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid page magic number: expected 0x%08X, got 0x%08X",
-						PROCSTAT_PAGE_MAGIC, page->header.magic)));
-
-	if (page->header.size > PROCSTAT_PAGE_SIZE - sizeof(ProcstatPageHeader))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid page size: %zu", page->header.size)));
-
-	/* Verify checksum */
-	expected_checksum = calculate_checksum(page->data, page->header.size);
-	if (page->header.checksum != expected_checksum)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("page checksum mismatch: expected 0x%08X, got 0x%08X",
-						expected_checksum, page->header.checksum)));
-}
-
-/*
- * write_page - Append the page to existing file or create a new one
+ * write_page - Append the page to existing file
  */
 static void
 write_page(Page page)
 {
 	PgFile	   *file;
-	uint32		next_page_num;
+	uint32		page_num;
 	char		page_buffer[PROCSTAT_PAGE_SIZE];
-
-	Assert(page != NULL);
-	Assert(page->header.size <= PROCSTAT_PAGE_SIZE - sizeof(ProcstatPageHeader));
 
 	/* Open the file */
 	file = pgfile_open(PROCSTAT_FILENAME);
 
-	/* Get the next page number (total pages = next page number) */
-	next_page_num = pgfile_num_pages(file);
+	/* Get the next page number */
+	page_num = pgfile_num_pages(file);
 
-	/* Update page header with metadata */
-	page->header.page_number = next_page_num;
+	/* Update page header */
+	page->header.page_number = page_num;
 	page->header.timestamp = GetCurrentTimestamp();
-	page->header.magic = PROCSTAT_PAGE_MAGIC;
-	page->header.checksum = calculate_checksum(page->data, page->header.size);
 
-	/* Prepare full page buffer (header + data) */
+	/* Copy page to buffer */
 	memset(page_buffer, 0, PROCSTAT_PAGE_SIZE);
 	memcpy(page_buffer, &page->header, sizeof(ProcstatPageHeader));
 	memcpy(page_buffer + sizeof(ProcstatPageHeader), page->data, page->header.size);
 
-	/* Write the page (this appends to the file) */
-	pgfile_write_page(file, next_page_num, page_buffer);
+	/* Write and sync */
+	pgfile_write_page(file, page_num, page_buffer);
 	pgfile_sync(file);
-
 	pgfile_close(file);
 }
 
 /*
  * init_reader - Initialize reader for bidirectional reading
- *
- * forward=true:  Read from start (page 0) to end
- * forward=false: Read from end to start (reverse)
  */
 static ProcstatFileReader
 init_reader(bool forward)
 {
 	ProcstatFileReader reader;
-	PgFile	   *file;
 
 	memset(&reader, 0, sizeof(ProcstatFileReader));
 
-	/* Open the file */
-	file = pgfile_open(PROCSTAT_FILENAME);
-
-	/* Initialize reader context */
-	reader.file = file;
-	reader.total_pages = pgfile_num_pages(file);
+	reader.file = pgfile_open(PROCSTAT_FILENAME);
 	reader.forward = forward;
-	reader.initialized = true;
-	reader.exhausted = (reader.total_pages == 0);
 
 	if (forward)
-	{
-		/* Forward reading: start at page 0 */
 		reader.current_page_idx = 0;
-	}
 	else
-	{
-		/* Backward reading: start at last page */
-		reader.current_page_idx = reader.total_pages - 1;
-	}
+		reader.current_page_idx = pgfile_num_pages(reader.file) - 1;
 
 	return reader;
 }
 
 /*
  * get_next_page - Read next page based on direction
- *
- * Returns pointer to page in reader's buffer, or NULL if no more pages.
- * The returned pointer is valid until the next call to get_next_page().
  */
 static Page
 get_next_page(ProcstatFileReader *reader)
 {
-	Page		page;
-
-	Assert(reader != NULL);
-	Assert(reader->initialized);
-
-	/* Check if exhausted */
-	if (reader->exhausted)
-		return NULL;
+	int			total_pages = pgfile_num_pages(reader->file);
 
 	/* Check bounds */
-	if (reader->forward)
-	{
-		if (reader->current_page_idx >= reader->total_pages)
-		{
-			reader->exhausted = true;
-			return NULL;
-		}
-	}
-	else
-	{
-		if (reader->current_page_idx < 0)
-		{
-			reader->exhausted = true;
-			return NULL;
-		}
-	}
+	if (reader->forward && reader->current_page_idx >= total_pages)
+		return NULL;
+	if (!reader->forward && reader->current_page_idx < 0)
+		return NULL;
 
-	/* Read the current page */
+	/* Read the page */
 	pgfile_read_page(reader->file, reader->current_page_idx, reader->page_buffer);
 
-	/* Cast buffer to page structure */
-	page = (Page) reader->page_buffer;
-
-	/* Validate page */
-	validate_page(page);
-
-	/* Advance to next page based on direction */
+	/* Advance index */
 	if (reader->forward)
 		reader->current_page_idx++;
 	else
 		reader->current_page_idx--;
 
-	return page;
+	return (Page) reader->page_buffer;
 }
 
 /*
