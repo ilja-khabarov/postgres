@@ -36,7 +36,6 @@ SUBDIRS = \
 		pg_overexplain \
 		pg_prewarm	\
 		pg_procstat	\
-		pg_simple_kv	\
 		pg_stat_statements \
 		pg_surgery	\
 		pg_trgm		\

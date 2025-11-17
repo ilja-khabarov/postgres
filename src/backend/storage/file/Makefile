@@ -17,7 +17,6 @@ OBJS = \
 	copydir.o \
 	fd.o \
 	fileset.o \
-	pgfile.o \
 	reinit.o \
 	sharedfileset.o
 

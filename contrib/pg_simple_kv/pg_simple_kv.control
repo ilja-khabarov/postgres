@@ -1,5 +1,0 @@
-# pg_simple_kv extension
-comment = 'Simple persistent key-value store using page-based file I/O'
-default_version = '1.0'
-module_pathname = '$libdir/pg_simple_kv'
-relocatable = true
