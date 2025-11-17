@@ -5,13 +5,17 @@ This extension demonstrates advanced page-based file I/O patterns by implementin
 a process statistics recorder that stores PostgreSQL backend statistics snapshots
 in fixed-size pages and supports bidirectional reading.
 
+The extension is completely self-contained with an integrated page-based file I/O
+implementation built directly into the extension code.
+
 Key Features
 ------------
 * Custom page structure with metadata headers
 * Bidirectional page reading (forward and backward)
 * Process statistics snapshots stored in pages
 * Page validation with magic numbers and checksums
-* Efficient storage using the pgfile module
+* Integrated page-based file I/O implementation (8KB fixed-size pages)
+* Self-contained extension with no external dependencies
 * Demonstrates advanced page I/O patterns
 
 Architecture
@@ -180,7 +184,7 @@ This extension pattern is useful for:
 Performance Characteristics
 ---------------------------
 
-* Page reads: O(1) random access via pgfile
+* Page reads: O(1) random access via integrated page I/O
 * Forward scan: O(n) where n = number of pages
 * Backward scan: O(n) where n = number of pages
 * Memory usage: Constant (one page buffer per reader)
@@ -198,9 +202,19 @@ Technical Details
 **Checksum Algorithm:** Simple additive checksum
   checksum = Σ((checksum << 5) + checksum + byte[i])
 
-**Dependencies:**
-* pgfile module (src/backend/storage/file/pgfile.c)
-* PostgreSQL process statistics (pgstat)
+**Integrated Page I/O Implementation:**
+The extension includes a complete page-based file I/O implementation integrated
+directly into the source code (pg_procstat.c). This provides:
+* PgFile structure for file handles
+* pgfile_open/close for file management
+* pgfile_write_page/read_page for page I/O
+* pgfile_sync for durability
+* pgfile_num_pages for metadata
+* All functions are static (internal to the extension)
+
+**External Dependencies:**
+* PostgreSQL Virtual File Descriptor (VFD) system (storage/fd.h)
+* PostgreSQL process statistics API (pgstat)
 
 Author
 ------

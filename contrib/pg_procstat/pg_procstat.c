@@ -6,13 +6,16 @@
  * This extension demonstrates advanced page-based file I/O patterns including:
  *   - Custom page headers with metadata
  *   - Bidirectional page reading (forward and backward)
- *   - Efficient page-based storage using pgfile module
+ *   - Efficient page-based storage (integrated pgfile implementation)
  *   - Recording process statistics snapshots over time
  *
  * The extension records PostgreSQL backend process statistics (PID, database,
  * user, query start time, etc.) and stores them in fixed-size pages. Pages
  * can be read in both directions - forward (chronological) or backward
  * (reverse chronological).
+ *
+ * This extension includes an integrated page-based file I/O implementation
+ * (based on pgfile) that provides simple fixed-size page storage.
  *
  * Copyright (c) 2025, PostgreSQL Global Development Group
  *
@@ -25,16 +28,18 @@
 #include "postgres.h"
 
 #include <time.h>
+#include <unistd.h>
 
 #include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
-#include "storage/pgfile.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 PG_MODULE_MAGIC;
@@ -42,8 +47,235 @@ PG_MODULE_MAGIC;
 /* Storage file name */
 #define PROCSTAT_FILENAME	"procstat.dat"
 
-/* Page size - use pgfile's fixed page size */
+/* Page size - fixed at 8KB */
+#define PGFILE_PAGE_SIZE	8192
 #define PROCSTAT_PAGE_SIZE	PGFILE_PAGE_SIZE
+
+/*
+ * =========================================================================
+ * INTEGRATED PAGE-BASED FILE I/O IMPLEMENTATION
+ * =========================================================================
+ *
+ * This section provides a simple page-based file I/O interface integrated
+ * directly into the extension. It manages fixed-size pages (8KB) stored
+ * in files within the PostgreSQL data directory.
+ */
+
+/*
+ * PgFile - structure representing an open page-based file
+ */
+typedef struct PgFile
+{
+	File		vfd;			/* virtual file descriptor */
+	char	   *filename;		/* filename (palloc'd) */
+	uint32		num_pages;		/* cached number of pages in file */
+} PgFile;
+
+/* Forward declarations for integrated pgfile functions */
+static PgFile *pgfile_open(const char *filename);
+static void pgfile_close(PgFile *file);
+static void pgfile_write_page(PgFile *file, uint32 pageno, const char *buffer);
+static void pgfile_read_page(PgFile *file, uint32 pageno, char *buffer);
+static void pgfile_sync(PgFile *file);
+static uint32 pgfile_num_pages(PgFile *file);
+static void pgfile_unlink(const char *filename);
+
+/*
+ * pgfile_open - Open or create a page-based file
+ *
+ * Opens a file in the PostgreSQL data directory. Creates it if it doesn't exist.
+ * Returns a PgFile handle that must be closed with pgfile_close().
+ */
+static PgFile *
+pgfile_open(const char *filename)
+{
+	PgFile	   *pgfile;
+	File		vfd;
+	char		path[MAXPGPATH];
+	off_t		file_size;
+
+	/* Build the full path in the data directory */
+	snprintf(path, MAXPGPATH, "%s/%s", DataDir, filename);
+
+	/* Open or create the file */
+	vfd = PathNameOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	if (vfd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+
+	/* Allocate and initialize the PgFile structure */
+	pgfile = (PgFile *) MemoryContextAlloc(TopMemoryContext, sizeof(PgFile));
+	pgfile->vfd = vfd;
+	pgfile->filename = MemoryContextStrdup(TopMemoryContext, filename);
+
+	/* Determine the current number of pages in the file */
+	file_size = FileSize(vfd);
+	if (file_size < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not get size of file \"%s\": %m", path)));
+
+	pgfile->num_pages = file_size / PGFILE_PAGE_SIZE;
+
+	return pgfile;
+}
+
+/*
+ * pgfile_close - Close a page-based file
+ *
+ * Closes the file and frees associated resources.
+ */
+static void
+pgfile_close(PgFile *file)
+{
+	if (file == NULL)
+		return;
+
+	FileClose(file->vfd);
+	pfree(file->filename);
+	pfree(file);
+}
+
+/*
+ * pgfile_write_page - Write a page at the specified page number
+ *
+ * The buffer must be exactly PGFILE_PAGE_SIZE bytes.
+ * If the page number is beyond the current end of file, the file is extended.
+ */
+static void
+pgfile_write_page(PgFile *file, uint32 pageno, const char *buffer)
+{
+	off_t		offset;
+	int			nbytes;
+
+	Assert(file != NULL);
+	Assert(buffer != NULL);
+
+	/* Calculate the byte offset for this page */
+	offset = (off_t) pageno * PGFILE_PAGE_SIZE;
+
+	/* Write the page */
+	nbytes = FileWrite(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
+					   WAIT_EVENT_DATA_FILE_WRITE);
+
+	if (nbytes != PGFILE_PAGE_SIZE)
+	{
+		if (nbytes < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to file \"%s\" at offset %llu: %m",
+							file->filename, (unsigned long long) offset)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("could not write to file \"%s\" at offset %llu: wrote only %d of %d bytes",
+							file->filename, (unsigned long long) offset,
+							nbytes, PGFILE_PAGE_SIZE)));
+	}
+
+	/* Update cached page count if we extended the file */
+	if (pageno >= file->num_pages)
+		file->num_pages = pageno + 1;
+}
+
+/*
+ * pgfile_read_page - Read a page at the specified page number
+ *
+ * The buffer must be at least PGFILE_PAGE_SIZE bytes.
+ * Returns an error if the page number is beyond the end of the file.
+ */
+static void
+pgfile_read_page(PgFile *file, uint32 pageno, char *buffer)
+{
+	off_t		offset;
+	int			nbytes;
+
+	Assert(file != NULL);
+	Assert(buffer != NULL);
+
+	/* Check if the page number is valid */
+	if (pageno >= file->num_pages)
+		ereport(ERROR,
+				(errcode(ERRCODE_IO_ERROR),
+				 errmsg("cannot read page %u from file \"%s\": file has only %u pages",
+						pageno, file->filename, file->num_pages)));
+
+	/* Calculate the byte offset for this page */
+	offset = (off_t) pageno * PGFILE_PAGE_SIZE;
+
+	/* Read the page */
+	nbytes = FileRead(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
+					  WAIT_EVENT_DATA_FILE_READ);
+
+	if (nbytes != PGFILE_PAGE_SIZE)
+	{
+		if (nbytes < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read from file \"%s\" at offset %llu: %m",
+							file->filename, (unsigned long long) offset)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("could not read from file \"%s\" at offset %llu: read only %d of %d bytes",
+							file->filename, (unsigned long long) offset,
+							nbytes, PGFILE_PAGE_SIZE)));
+	}
+}
+
+/*
+ * pgfile_sync - Sync the file to disk
+ *
+ * Ensures all written data is durably stored on disk.
+ */
+static void
+pgfile_sync(PgFile *file)
+{
+	Assert(file != NULL);
+
+	if (FileSync(file->vfd, WAIT_EVENT_DATA_FILE_SYNC) < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not sync file \"%s\": %m", file->filename)));
+}
+
+/*
+ * pgfile_num_pages - Get the total number of pages in the file
+ */
+static uint32
+pgfile_num_pages(PgFile *file)
+{
+	Assert(file != NULL);
+	return file->num_pages;
+}
+
+/*
+ * pgfile_unlink - Delete a page-based file
+ *
+ * Deletes the file from the data directory.
+ * The file must be closed before calling this function.
+ */
+static void
+pgfile_unlink(const char *filename)
+{
+	char		path[MAXPGPATH];
+
+	/* Build the full path in the data directory */
+	snprintf(path, MAXPGPATH, "%s/%s", DataDir, filename);
+
+	/* Delete the file */
+	if (unlink(path) < 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not unlink file \"%s\": %m", path)));
+}
+
+/*
+ * =========================================================================
+ * PROCESS STATISTICS RECORDING (PROCSTAT)
+ * =========================================================================
+ */
 
 /*
  * The page header - page metadata

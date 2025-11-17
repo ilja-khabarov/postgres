@@ -10,7 +10,7 @@ if host_system == 'windows'
     '--FILEDESC', 'pg_procstat - process statistics recorder with bidirectional page-based reading',])
 endif
 
-# Note: This extension depends on pgfile module from the backend
+# Note: This extension includes integrated page-based file I/O implementation
 pg_procstat = shared_module('pg_procstat',
   pg_procstat_sources,
   kwargs: contrib_mod_args,
