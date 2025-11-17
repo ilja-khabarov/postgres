@@ -53,222 +53,19 @@ PG_MODULE_MAGIC;
 
 /*
  * =========================================================================
- * INTEGRATED PAGE-BASED FILE I/O IMPLEMENTATION
+ * FILE I/O HELPERS
  * =========================================================================
- *
- * This section provides a simple page-based file I/O interface integrated
- * directly into the extension. It manages fixed-size pages (8KB) stored
- * in files within the PostgreSQL data directory.
  */
 
-/*
- * PgFile - structure representing an open page-based file
- */
-typedef struct PgFile
+/* Helper: Get number of pages in file */
+static inline uint32
+get_num_pages(File file)
 {
-	File		vfd;			/* virtual file descriptor */
-	char	   *filename;		/* filename (palloc'd) */
-	uint32		num_pages;		/* cached number of pages in file */
-} PgFile;
+	off_t		size = FileSize(file);
 
-/* Forward declarations for integrated pgfile functions */
-static PgFile *pgfile_open(const char *filename);
-static void pgfile_close(PgFile *file);
-static void pgfile_write_page(PgFile *file, uint32 pageno, const char *buffer);
-static void pgfile_read_page(PgFile *file, uint32 pageno, char *buffer);
-static void pgfile_sync(PgFile *file);
-static uint32 pgfile_num_pages(PgFile *file);
-static void pgfile_unlink(const char *filename);
-
-/*
- * pgfile_open - Open or create a page-based file
- *
- * Opens a file in the PostgreSQL data directory. Creates it if it doesn't exist.
- * Returns a PgFile handle that must be closed with pgfile_close().
- */
-static PgFile *
-pgfile_open(const char *filename)
-{
-	PgFile	   *pgfile;
-	File		vfd;
-	char		path[MAXPGPATH];
-	off_t		file_size;
-
-	/* Build the full path in the data directory */
-	snprintf(path, MAXPGPATH, "%s/%s", DataDir, filename);
-
-	/* Open or create the file */
-	vfd = PathNameOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
-	if (vfd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", path)));
-
-	/* Allocate and initialize the PgFile structure */
-	pgfile = (PgFile *) MemoryContextAlloc(TopMemoryContext, sizeof(PgFile));
-	pgfile->vfd = vfd;
-	pgfile->filename = MemoryContextStrdup(TopMemoryContext, filename);
-
-	/* Determine the current number of pages in the file */
-	file_size = FileSize(vfd);
-	if (file_size < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not get size of file \"%s\": %m", path)));
-
-	pgfile->num_pages = file_size / PGFILE_PAGE_SIZE;
-
-	return pgfile;
-}
-
-/*
- * pgfile_close - Close a page-based file
- *
- * Closes the file and frees associated resources.
- */
-static void
-pgfile_close(PgFile *file)
-{
-	if (file == NULL)
-		return;
-
-	FileClose(file->vfd);
-	pfree(file->filename);
-	pfree(file);
-}
-
-/*
- * pgfile_write_page - Write a page at the specified page number
- *
- * The buffer must be exactly PGFILE_PAGE_SIZE bytes.
- * If the page number is beyond the current end of file, the file is extended.
- */
-static void
-pgfile_write_page(PgFile *file, uint32 pageno, const char *buffer)
-{
-	off_t		offset;
-	int			nbytes;
-
-	Assert(file != NULL);
-	Assert(buffer != NULL);
-
-	/* Calculate the byte offset for this page */
-	offset = (off_t) pageno * PGFILE_PAGE_SIZE;
-
-	/* Write the page */
-	nbytes = FileWrite(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
-					   WAIT_EVENT_DATA_FILE_WRITE);
-
-	if (nbytes != PGFILE_PAGE_SIZE)
-	{
-		if (nbytes < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not write to file \"%s\" at offset %llu: %m",
-							file->filename, (unsigned long long) offset)));
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_IO_ERROR),
-					 errmsg("could not write to file \"%s\" at offset %llu: wrote only %d of %d bytes",
-							file->filename, (unsigned long long) offset,
-							nbytes, PGFILE_PAGE_SIZE)));
-	}
-
-	/* Update cached page count if we extended the file */
-	if (pageno >= file->num_pages)
-		file->num_pages = pageno + 1;
-}
-
-/*
- * pgfile_read_page - Read a page at the specified page number
- *
- * The buffer must be at least PGFILE_PAGE_SIZE bytes.
- * Returns an error if the page number is beyond the end of the file.
- */
-static void
-pgfile_read_page(PgFile *file, uint32 pageno, char *buffer)
-{
-	off_t		offset;
-	int			nbytes;
-
-	Assert(file != NULL);
-	Assert(buffer != NULL);
-
-	/* Check if the page number is valid */
-	if (pageno >= file->num_pages)
-		ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				 errmsg("cannot read page %u from file \"%s\": file has only %u pages",
-						pageno, file->filename, file->num_pages)));
-
-	/* Calculate the byte offset for this page */
-	offset = (off_t) pageno * PGFILE_PAGE_SIZE;
-
-	/* Read the page */
-	nbytes = FileRead(file->vfd, buffer, PGFILE_PAGE_SIZE, offset,
-					  WAIT_EVENT_DATA_FILE_READ);
-
-	if (nbytes != PGFILE_PAGE_SIZE)
-	{
-		if (nbytes < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not read from file \"%s\" at offset %llu: %m",
-							file->filename, (unsigned long long) offset)));
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_IO_ERROR),
-					 errmsg("could not read from file \"%s\" at offset %llu: read only %d of %d bytes",
-							file->filename, (unsigned long long) offset,
-							nbytes, PGFILE_PAGE_SIZE)));
-	}
-}
-
-/*
- * pgfile_sync - Sync the file to disk
- *
- * Ensures all written data is durably stored on disk.
- */
-static void
-pgfile_sync(PgFile *file)
-{
-	Assert(file != NULL);
-
-	if (FileSync(file->vfd, WAIT_EVENT_DATA_FILE_SYNC) < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not sync file \"%s\": %m", file->filename)));
-}
-
-/*
- * pgfile_num_pages - Get the total number of pages in the file
- */
-static uint32
-pgfile_num_pages(PgFile *file)
-{
-	Assert(file != NULL);
-	return file->num_pages;
-}
-
-/*
- * pgfile_unlink - Delete a page-based file
- *
- * Deletes the file from the data directory.
- * The file must be closed before calling this function.
- */
-static void
-pgfile_unlink(const char *filename)
-{
-	char		path[MAXPGPATH];
-
-	/* Build the full path in the data directory */
-	snprintf(path, MAXPGPATH, "%s/%s", DataDir, filename);
-
-	/* Delete the file */
-	if (unlink(path) < 0 && errno != ENOENT)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not unlink file \"%s\": %m", path)));
+	if (size < 0)
+		return 0;
+	return size / PGFILE_PAGE_SIZE;
 }
 
 /*
@@ -322,7 +119,7 @@ typedef struct ProcstatRecord
  */
 typedef struct ProcstatFileReader
 {
-	PgFile	   *file;			/* pgfile handle */
+	File		fd;				/* File descriptor */
 	int			current_page_idx;	/* Current page index */
 	bool		forward;		/* Direction: true=forward, false=backward */
 	char		page_buffer[PROCSTAT_PAGE_SIZE]; /* Buffer for current page */
@@ -339,29 +136,43 @@ static Page get_next_page(ProcstatFileReader *reader);
 static void
 write_page(Page page)
 {
-	PgFile	   *file;
+	File		file;
+	char		path[MAXPGPATH];
 	uint32		page_num;
+	off_t		offset;
 	char		page_buffer[PROCSTAT_PAGE_SIZE];
 
-	/* Open the file */
-	file = pgfile_open(PROCSTAT_FILENAME);
+	/* Open file */
+	snprintf(path, MAXPGPATH, "%s/%s", DataDir, PROCSTAT_FILENAME);
+	file = PathNameOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	if (file < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
 
-	/* Get the next page number */
-	page_num = pgfile_num_pages(file);
+	/* Get next page number */
+	page_num = get_num_pages(file);
 
 	/* Update page header */
 	page->header.page_number = page_num;
 	page->header.timestamp = GetCurrentTimestamp();
 
-	/* Copy page to buffer */
+	/* Prepare page buffer */
 	memset(page_buffer, 0, PROCSTAT_PAGE_SIZE);
 	memcpy(page_buffer, &page->header, sizeof(ProcstatPageHeader));
 	memcpy(page_buffer + sizeof(ProcstatPageHeader), page->data, page->header.size);
 
-	/* Write and sync */
-	pgfile_write_page(file, page_num, page_buffer);
-	pgfile_sync(file);
-	pgfile_close(file);
+	/* Write page */
+	offset = (off_t) page_num * PGFILE_PAGE_SIZE;
+	if (FileWrite(file, page_buffer, PGFILE_PAGE_SIZE, offset,
+				  WAIT_EVENT_DATA_FILE_WRITE) != PGFILE_PAGE_SIZE)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", path)));
+
+	/* Sync and close */
+	FileSync(file, WAIT_EVENT_DATA_FILE_SYNC);
+	FileClose(file);
 }
 
 /*
@@ -371,16 +182,26 @@ static ProcstatFileReader
 init_reader(bool forward)
 {
 	ProcstatFileReader reader;
+	File		file;
+	char		path[MAXPGPATH];
 
 	memset(&reader, 0, sizeof(ProcstatFileReader));
 
-	reader.file = pgfile_open(PROCSTAT_FILENAME);
+	/* Open file */
+	snprintf(path, MAXPGPATH, "%s/%s", DataDir, PROCSTAT_FILENAME);
+	file = PathNameOpenFile(path, O_RDONLY | PG_BINARY);
+	if (file < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+
+	reader.fd = file;
 	reader.forward = forward;
 
 	if (forward)
 		reader.current_page_idx = 0;
 	else
-		reader.current_page_idx = pgfile_num_pages(reader.file) - 1;
+		reader.current_page_idx = get_num_pages(file) - 1;
 
 	return reader;
 }
@@ -391,7 +212,11 @@ init_reader(bool forward)
 static Page
 get_next_page(ProcstatFileReader *reader)
 {
-	int			total_pages = pgfile_num_pages(reader->file);
+	int			total_pages;
+	off_t		offset;
+
+	/* Get total pages */
+	total_pages = get_num_pages(reader->fd);
 
 	/* Check bounds */
 	if (reader->forward && reader->current_page_idx >= total_pages)
@@ -400,7 +225,12 @@ get_next_page(ProcstatFileReader *reader)
 		return NULL;
 
 	/* Read the page */
-	pgfile_read_page(reader->file, reader->current_page_idx, reader->page_buffer);
+	offset = (off_t) reader->current_page_idx * PGFILE_PAGE_SIZE;
+	if (FileRead(reader->fd, reader->page_buffer, PGFILE_PAGE_SIZE, offset,
+				 WAIT_EVENT_DATA_FILE_READ) != PGFILE_PAGE_SIZE)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read file: %m")));
 
 	/* Advance index */
 	if (reader->forward)
@@ -571,7 +401,7 @@ procstat_read_forward(PG_FUNCTION_ARGS)
 			if (page == NULL)
 			{
 				/* No more pages */
-				pgfile_close(reader->file);
+				FileClose(reader->fd);
 				SRF_RETURN_DONE(funcctx);
 			}
 			records = (ProcstatRecord *) page->data;
@@ -676,7 +506,7 @@ procstat_read_backward(PG_FUNCTION_ARGS)
 			if (page == NULL)
 			{
 				/* No more pages */
-				pgfile_close(reader->file);
+				FileClose(reader->fd);
 				SRF_RETURN_DONE(funcctx);
 			}
 			records = (ProcstatRecord *) page->data;
@@ -732,7 +562,14 @@ PG_FUNCTION_INFO_V1(procstat_clear);
 Datum
 procstat_clear(PG_FUNCTION_ARGS)
 {
-	pgfile_unlink(PROCSTAT_FILENAME);
+	char		path[MAXPGPATH];
+
+	snprintf(path, MAXPGPATH, "%s/%s", DataDir, PROCSTAT_FILENAME);
+	if (unlink(path) != 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove file \"%s\": %m", path)));
+
 	PG_RETURN_VOID();
 }
 
@@ -743,7 +580,8 @@ PG_FUNCTION_INFO_V1(procstat_stats);
 Datum
 procstat_stats(PG_FUNCTION_ARGS)
 {
-	PgFile	   *file;
+	File		file;
+	char		path[MAXPGPATH];
 	TupleDesc	tupdesc;
 	Datum		values[3];
 	bool		nulls[3];
@@ -752,10 +590,16 @@ procstat_stats(PG_FUNCTION_ARGS)
 	int64		file_size;
 
 	/* Open the file */
-	file = pgfile_open(PROCSTAT_FILENAME);
-	num_pages = pgfile_num_pages(file);
+	snprintf(path, MAXPGPATH, "%s/%s", DataDir, PROCSTAT_FILENAME);
+	file = PathNameOpenFile(path, O_RDONLY | PG_BINARY);
+	if (file < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+
+	num_pages = get_num_pages(file);
 	file_size = (int64) num_pages * PROCSTAT_PAGE_SIZE;
-	pgfile_close(file);
+	FileClose(file);
 
 	/* Build tuple descriptor */
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
