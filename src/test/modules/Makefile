@@ -12,6 +12,7 @@ SUBDIRS = \
 		  dummy_seclabel \
 		  libpq_pipeline \
 		  oauth_validator \
+		  pg_procstat \
 		  plsample \
 		  spgist_name_ops \
 		  test_aio \

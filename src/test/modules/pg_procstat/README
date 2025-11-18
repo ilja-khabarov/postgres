@@ -1,0 +1,37 @@
+pg_procstat
+===========
+
+This module provides test functions for procstat file operations.
+
+Functions
+---------
+
+qdb_procstat_test_write(value integer) - void
+  Writes an integer value to a test file in the PostgreSQL data directory.
+  The file is named 'pg_procstat_test.dat' and is created in the data
+  directory. If the file exists, it will be overwritten.
+
+qdb_procstat_test_read() - integer
+  Reads an integer value from the test file created by qdb_procstat_test_write().
+  Returns the integer value stored in the file.
+  Raises an error if the file doesn't exist or cannot be read.
+
+Usage Example
+-------------
+
+After installing the extension:
+
+  CREATE EXTENSION pg_procstat;
+
+  -- Write a value to the test file
+  SELECT qdb_procstat_test_write(42);
+
+  -- Read the value back
+  SELECT qdb_procstat_test_read();  -- Returns: 42
+
+Notes
+-----
+
+The test file is stored in the PostgreSQL data directory and persists
+across sessions. The file operations use PostgreSQL's transient file
+API for proper resource management.

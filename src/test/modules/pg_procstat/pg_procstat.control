@@ -1,0 +1,4 @@
+comment = 'Test code for procstat file operations'
+default_version = '1.0'
+module_pathname = '$libdir/pg_procstat'
+relocatable = true
